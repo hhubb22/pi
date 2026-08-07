@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd -- "$repo_root"
+
+log_step() {
+	local label="$1"
+	shift
+	local started=$SECONDS
+	printf '[setup] %s\n' "$label"
+	"$@"
+	printf '[setup] %s completed in %ss\n' "$label" "$((SECONDS - started))"
+}
+
+install_system_dependencies() {
+	local required_packages=(
+		libcairo2-dev
+		libpango1.0-dev
+		libjpeg-dev
+		libgif-dev
+		librsvg2-dev
+	)
+	local missing_packages=()
+	local package
+
+	for package in "${required_packages[@]}"; do
+		if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -Fq 'install ok installed'; then
+			missing_packages+=("$package")
+		fi
+	done
+
+	command -v curl >/dev/null 2>&1 || missing_packages+=(curl ca-certificates)
+	command -v xz >/dev/null 2>&1 || missing_packages+=(xz-utils)
+	command -v rg >/dev/null 2>&1 || missing_packages+=(ripgrep)
+	if ! command -v fd >/dev/null 2>&1 && ! command -v fdfind >/dev/null 2>&1; then
+		missing_packages+=(fd-find)
+	fi
+
+	if ((${#missing_packages[@]} == 0)); then
+		printf '[setup] System dependencies already installed\n'
+		return
+	fi
+
+	local privilege=()
+	if ((EUID != 0)); then
+		privilege=(sudo)
+	fi
+	"${privilege[@]}" apt-get update
+	"${privilege[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_packages[@]}"
+}
+
+node_version="v22.23.2"
+case "$(uname -m)" in
+	x86_64) node_arch="x64" ;;
+	aarch64 | arm64) node_arch="arm64" ;;
+	*)
+		printf '[setup] Unsupported architecture: %s\n' "$(uname -m)" >&2
+		exit 1
+		;;
+esac
+
+node_name="node-${node_version}-linux-${node_arch}"
+node_root="$HOME/.local/share/pi-orb/$node_name"
+node_link="$HOME/.local/share/pi-orb/node-22"
+
+install_node() {
+	if [[ -x "$node_root/bin/node" ]] && [[ "$($node_root/bin/node --version)" == "$node_version" ]]; then
+		printf '[setup] Node.js %s already installed\n' "$node_version"
+	else
+		local cache_dir="$HOME/.cache/pi-orb/node"
+		local archive_name="${node_name}.tar.xz"
+		local archive="$cache_dir/$archive_name"
+		local checksums="$cache_dir/SHASUMS256-${node_version}.txt"
+		local staging="${node_root}.installing.$$"
+		mkdir -p -- "$cache_dir" "$staging"
+
+		if [[ ! -f "$archive" ]]; then
+			curl -fsSL --retry 3 --output "$archive" "https://nodejs.org/dist/${node_version}/${archive_name}"
+		fi
+		if [[ ! -f "$checksums" ]]; then
+			curl -fsSL --retry 3 --output "$checksums" "https://nodejs.org/dist/${node_version}/SHASUMS256.txt"
+		fi
+		(
+			cd -- "$cache_dir"
+			grep -F "  ${archive_name}" "$checksums" | sha256sum --check --status
+		)
+		tar -xJf "$archive" --strip-components=1 -C "$staging"
+
+		if [[ -e "$node_root" ]]; then
+			mv -- "$node_root" "${node_root}.incomplete.$(date +%s)"
+		fi
+		mv -- "$staging" "$node_root"
+	fi
+
+	mkdir -p -- "$(dirname -- "$node_link")"
+	ln -sfn -- "$node_root" "$node_link"
+}
+
+configure_login_shell() {
+	local profile="$HOME/.bash_profile"
+	local marker='# pi orb Node.js toolchain'
+	if ! grep -Fqx "$marker" "$profile" 2>/dev/null; then
+		cat >>"$profile" <<'EOF'
+
+# pi orb Node.js toolchain
+export PATH="$HOME/.local/share/pi-orb/node-22/bin:$HOME/.local/bin:$PATH"
+EOF
+	fi
+}
+
+configure_fd() {
+	mkdir -p -- "$HOME/.local/bin"
+	if ! command -v fd >/dev/null 2>&1 && command -v fdfind >/dev/null 2>&1; then
+		ln -sfn -- "$(command -v fdfind)" "$HOME/.local/bin/fd"
+	fi
+}
+
+ensure_model_data() {
+	if npm run check:model-data >/dev/null 2>&1; then
+		printf '[setup] Generated model data is already valid\n'
+		return
+	fi
+	npm run hydrate:model-data
+}
+
+log_step 'Installing system dependencies' install_system_dependencies
+log_step "Installing Node.js $node_version" install_node
+log_step 'Configuring login shell' configure_login_shell
+
+export PATH="$node_link/bin:$HOME/.local/bin:$PATH"
+log_step 'Configuring fd command' configure_fd
+
+printf '[setup] Using Node.js %s and npm %s\n' "$(node --version)" "$(npm --version)"
+log_step 'Installing npm dependencies from package-lock.json' npm ci --ignore-scripts
+log_step 'Ensuring generated model data is available' ensure_model_data
+printf '[setup] Repository is ready\n'

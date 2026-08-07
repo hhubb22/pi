@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd -- "$repo_root"
+
+export PATH="$HOME/.local/share/pi-orb/node-22/bin:$HOME/.local/bin:$PATH"
+
+node -e '
+const [major, minor] = process.versions.node.split(".").map(Number);
+if (major < 22 || (major === 22 && minor < 19)) {
+	console.error(`Node.js >=22.19.0 is required; found ${process.version}. Run .agents/setup.`);
+	process.exit(1);
+}
+'
+
+if [[ ! -x node_modules/.bin/tsgo ]]; then
+	printf '[resume] Dependencies are missing; run .agents/setup\n' >&2
+	exit 1
+fi
+
+printf '[resume] Ready with Node.js %s\n' "$(node --version)"
